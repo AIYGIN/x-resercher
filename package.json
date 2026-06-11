@@ -1,21 +1,33 @@
 {
   "name": "x-resercher",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "private": true,
+  "description": "Fetch X recent search results, summarize them with Hermes, and send the digest to Slack.",
+  "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "fetch:x": "tsx src/fetch-x.ts",
+    "send:slack": "tsx src/send-slack.ts",
+    "daily": "bash daily.sh",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check",
+    "format": "biome format --write",
+    "check": "biome check --write"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
   "dependencies": {
     "dotenv": "^17.4.2"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.2.0",
     "@types/node": "^25.9.2",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
-  }
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@10.23.0"
 }
