@@ -1,0 +1,26 @@
+{
+  "name": "x-resercher",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "trend": "pnpm collect:trend && pnpm summarize:trend",
+    "ogiri": "pnpm collect:ogiri && pnpm summarize:ogiri",
+    "typecheck": "tsc --noEmit",
+    "collect:trend": "tsx src/collect.ts trend 10",
+    "collect:ogiri": "tsx src/collect.ts ogiri 10",
+    "summarize:trend": "tsx src/summarize.ts data/raw/x-trend-$(date +%F).txt trend",
+    "summarize:ogiri": "tsx src/summarize.ts data/raw/x-ogiri-$(date +%F).txt ogiri"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "packageManager": "pnpm@11.4.0",
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
