@@ -4,14 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "trend": "pnpm collect:trend && pnpm summarize:trend",
-    "ogiri": "pnpm collect:ogiri && pnpm summarize:ogiri",
-    "typecheck": "tsc --noEmit",
-    "collect:trend": "tsx src/collect.ts trend 10",
-    "collect:ogiri": "tsx src/collect.ts ogiri 10",
-    "summarize:trend": "tsx src/summarize.ts data/raw/x-trend-$(date +%F).txt trend",
-    "summarize:ogiri": "tsx src/summarize.ts data/raw/x-ogiri-$(date +%F).txt ogiri"
+    "start": "tsx src/index.ts",
+    "ai-trend": "tsx src/index.ts ai-trend --limit 30",
+    "company-latest": "tsx src/index.ts company-latest",
+    "company-comments": "tsx src/index.ts company-comments",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [],
   "author": "",

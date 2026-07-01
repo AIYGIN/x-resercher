@@ -1,6 +1,53 @@
 # x-researcher
 
-X/Twitter の公開検索結果を取得し、ローカルLLM（Ollama + qwen3:8b）で要約するための小さな実験プロジェクトです。
+X/Twitter の公開検索結果を `twitter` コマンドで取得し、ローカルLLM（Ollama + qwen3:8b）で要約・CSV化するための小さな実験プロジェクトです。
+
+## 現在のコマンド
+
+既存の汎用的な `x search` ではなく、以下の3パターンだけを扱います。
+
+```bash
+# 1. codex OR "AI Agent" を人気寄り・latestで30件取得し、コメント傾向/いいね数/閲覧数つきCSVと日本語説明レポートを作る
+pnpm ai-trend
+
+# 2. 企業名 AND 企業コードで最新情報を拾い、コメント内容も含めて要約する
+pnpm company-latest --companies data/companies.example.csv
+
+# 3. 企業名 AND 企業コードでコメント/リプライ内容の要約を重視する
+pnpm company-comments --companies data/companies.example.csv
+```
+
+出力先:
+
+- 生データ: `data/raw/*.json`
+- CSV: `data/raw/*.csv`
+- 要約: `data/reports/*.md`
+
+方針として、レポート本体（Markdown要約）以外はすべて `data/raw` に保存します。
+
+会社入力ファイルはCSVまたはJSONに対応しています。
+
+```csv
+name,code
+トヨタ自動車,7203
+ソニーグループ,6758
+```
+
+主なオプション:
+
+```bash
+pnpm start -- ai-trend --limit 30 --min-likes 0 --max-likes 100 --min-retweets 0 --replies-per-tweet 5
+pnpm start -- company-latest --companies data/companies.csv --limit-per-company 10 --min-likes 0 --max-likes 100 --min-retweets 0 --replies-per-tweet 3
+pnpm start -- company-comments --companies data/companies.csv --limit-per-company 5 --min-likes 0 --max-likes 100 --min-retweets 0 --replies-per-tweet 10
+```
+
+人気度の調整:
+
+- `--min-likes`: いいね数の下限。未指定なら0。
+- `--max-likes`: いいね数の上限。未指定なら上限なし。
+- `--min-retweets`: リツイート数の下限。未指定なら0。
+
+事前確認だけしたい場合は `--dry-run` を付けます。
 
 ## 目的
 
