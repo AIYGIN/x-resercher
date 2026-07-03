@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const OLLAMA_MODEL = "qwen3:8b";
 const OLLAMA_URL = "http://localhost:11434/api/chat";
+const TWITTER_COMMAND_TIMEOUT_MS = 120_000;
+const OLLAMA_TIMEOUT_MS = 300_000;
 
 type Command = "ai-trend" | "company-latest" | "company-comments";
 
@@ -74,6 +76,14 @@ type Company = {
 };
 
 type Options = Record<string, string | boolean>;
+
+type RunEvent = {
+  at: string;
+  level: "info" | "warn" | "error";
+  message: string;
+  company?: Company;
+  details?: Record<string, unknown>;
+};
 
 function usage(exitCode = 0): never {
   const text = `
@@ -174,6 +184,33 @@ function today(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatDuration(startedAtMs: number): string {
+  return `${((Date.now() - startedAtMs) / 1000).toFixed(1)}s`;
+}
+
+function logRunEvent(events: RunEvent[], event: Omit<RunEvent, "at">): void {
+  const entry: RunEvent = { at: nowIso(), ...event };
+  events.push(entry);
+  const company = entry.company ? ` ${entry.company.name}(${entry.company.code})` : "";
+  const details = entry.details ? ` ${JSON.stringify(entry.details)}` : "";
+  const line = `[${entry.at}] ${entry.level.toUpperCase()}:${company} ${entry.message}${details}`;
+  if (entry.level === "error") console.error(line);
+  else if (entry.level === "warn") console.warn(line);
+  else console.log(line);
+}
+
+async function writeRunEvents(tracePath: string, events: RunEvent[]): Promise<void> {
+  await writeFile(tracePath, events.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf-8");
+}
+
 function engagement(tweet: Tweet): number {
   const m = tweet.metrics ?? {};
   return (m.likes ?? 0) + (m.retweets ?? 0) * 2 + (m.replies ?? 0) * 1.5 + (m.quotes ?? 0) * 2 + (m.bookmarks ?? 0);
@@ -228,7 +265,7 @@ function compactTweet(tweet: Tweet): Record<string, unknown> {
 
 async function searchTwitter(query: string, max: number, type: "latest" | "top" = "latest"): Promise<Tweet[]> {
   const args = ["search", query, "--type", type, "-n", String(max), "--json", "--full-text"];
-  const { stdout } = await execFileAsync("twitter", args, { maxBuffer: 10 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("twitter", args, { maxBuffer: 10 * 1024 * 1024, timeout: TWITTER_COMMAND_TIMEOUT_MS });
   const json = JSON.parse(stdout) as TwitterSearchResponse;
 
   if (!json.ok) {
@@ -244,6 +281,7 @@ async function fetchReplies(tweetId: string, max: number): Promise<Reply[]> {
   try {
     const { stdout } = await execFileAsync("twitter", ["tweet", tweetId, "-n", String(max), "--json", "--full-text"], {
       maxBuffer: 10 * 1024 * 1024,
+      timeout: TWITTER_COMMAND_TIMEOUT_MS,
     });
     const json = JSON.parse(stdout) as TwitterTweetResponse;
     return json.data?.replies ?? json.replies ?? [];
@@ -267,13 +305,15 @@ async function callOllama(system: string, prompt: string): Promise<string> {
   const res = await fetch(OLLAMA_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    signal: AbortSignal.timeout(OLLAMA_TIMEOUT_MS),
     body: JSON.stringify({
       model: OLLAMA_MODEL,
       stream: false,
-      options: { temperature: 0.2 },
+      think: false,
+      options: { temperature: 0.2, num_predict: 1200 },
       messages: [
         { role: "system", content: system },
-        { role: "user", content: prompt },
+        { role: "user", content: `/no_think\n${prompt}` },
       ],
     }),
   });
@@ -420,6 +460,7 @@ async function runCompany(options: Options, focusComments: boolean): Promise<voi
   const dryRun = options["dry-run"] === true;
   const outDir = optionString(options, "out-dir", "data") ?? "data";
   const companies = await readCompanies(companiesPath);
+  const events: RunEvent[] = [];
 
   if (companies.length === 0) throw new Error(`No companies found: ${companiesPath}`);
 
@@ -434,39 +475,82 @@ async function runCompany(options: Options, focusComments: boolean): Promise<voi
   await mkdir(path.join(outDir, "reports"), { recursive: true });
 
   const stamp = today();
-  const reportParts: string[] = [`# 企業X検索まとめ ${stamp}`];
-  const csvRows: Array<Record<string, unknown>> = [];
-  const allTweets: Tweet[] = [];
-
-  for (const company of companies) {
-    const query = `"${company.name}" ${company.code} -filter:retweets`;
-    const searched = await searchTwitter(query, Math.max(limitPerCompany * 3, limitPerCompany), "latest");
-    const filtered = searched
-      .filter((tweet) => matchesPopularity(tweet, minLikes, maxLikes, minRetweets))
-      .sort((a, b) => engagement(b) - engagement(a) || String(b.createdAtISO ?? "").localeCompare(String(a.createdAtISO ?? "")))
-      .slice(0, limitPerCompany);
-    if (filtered.length === 0) {
-      console.warn(`WARN: popularity filters matched 0 tweets for ${company.name} (${company.code}).`);
-    }
-    const tweets = (await withReplies(filtered, repliesPerTweet)).map((tweet) => ({ ...tweet, companyName: company.name, companyCode: company.code, searchQuery: query }));
-    allTweets.push(...tweets);
-    csvRows.push(...tweets.map((tweet) => ({ companyName: company.name, companyCode: company.code, ...compactTweet(tweet) })));
-    reportParts.push(`\n## ${company.name} (${company.code})\n`);
-    reportParts.push(await summarizeCompany(company, tweets, focusComments));
-  }
-
   const prefix = focusComments ? "company-comments" : "company-latest";
   const jsonPath = path.join(outDir, "raw", `${prefix}-${stamp}.json`);
   const csvPath = path.join(outDir, "raw", `${prefix}-${stamp}.csv`);
   const mdPath = path.join(outDir, "reports", `${prefix}-${stamp}.md`);
+  const tracePath = path.join(outDir, "raw", `${prefix}-${stamp}.trace.jsonl`);
+  const reportParts: string[] = [`# 企業X検索まとめ ${stamp}`];
+  const csvRows: Array<Record<string, unknown>> = [];
+  const allTweets: Tweet[] = [];
+
+  logRunEvent(events, {
+    level: "info",
+    message: "run started",
+    details: { companies: companies.length, limitPerCompany, repliesPerTweet, focusComments, outDir },
+  });
+
+  for (const [index, company] of companies.entries()) {
+    const companyStartedAt = Date.now();
+    const query = `"${company.name}" ${company.code} -filter:retweets`;
+    logRunEvent(events, {
+      level: "info",
+      message: "company started",
+      company,
+      details: { index: index + 1, total: companies.length, query },
+    });
+    await writeRunEvents(tracePath, events);
+
+    try {
+      logRunEvent(events, { level: "info", message: "search started", company, details: { max: Math.max(limitPerCompany * 3, limitPerCompany) } });
+      await writeRunEvents(tracePath, events);
+      const searched = await searchTwitter(query, Math.max(limitPerCompany * 3, limitPerCompany), "latest");
+      logRunEvent(events, { level: "info", message: "search finished", company, details: { count: searched.length } });
+
+      const filtered = searched
+        .filter((tweet) => matchesPopularity(tweet, minLikes, maxLikes, minRetweets))
+        .sort((a, b) => engagement(b) - engagement(a) || String(b.createdAtISO ?? "").localeCompare(String(a.createdAtISO ?? "")))
+        .slice(0, limitPerCompany);
+      if (filtered.length === 0) {
+        logRunEvent(events, { level: "warn", message: "popularity filters matched 0 tweets", company });
+      }
+
+      logRunEvent(events, { level: "info", message: "replies fetch started", company, details: { tweets: filtered.length, repliesPerTweet } });
+      await writeRunEvents(tracePath, events);
+      const tweets = (await withReplies(filtered, repliesPerTweet)).map((tweet) => ({ ...tweet, companyName: company.name, companyCode: company.code, searchQuery: query }));
+      logRunEvent(events, { level: "info", message: "replies fetched", company, details: { tweets: tweets.length, repliesPerTweet } });
+
+      allTweets.push(...tweets);
+      csvRows.push(...tweets.map((tweet) => ({ companyName: company.name, companyCode: company.code, ...compactTweet(tweet) })));
+      reportParts.push(`\n## ${company.name} (${company.code})\n`);
+      logRunEvent(events, { level: "info", message: "summary started", company, details: { tweets: tweets.length } });
+      await writeRunEvents(tracePath, events);
+      reportParts.push(await summarizeCompany(company, tweets, focusComments));
+      logRunEvent(events, { level: "info", message: "summary finished", company, details: { duration: formatDuration(companyStartedAt) } });
+    } catch (error) {
+      const message = errorMessage(error);
+      logRunEvent(events, { level: "error", message: "company failed; continuing with remaining companies", company, details: { error: message } });
+      reportParts.push(`\n## ${company.name} (${company.code})\n`);
+      reportParts.push(["この企業の処理は失敗しました。", "", `- エラー: ${message}`, `- クエリ: ${query}`, "- 詳細: trace JSONL を確認してください。"].join("\n"));
+    }
+
+    await writeRunEvents(tracePath, events);
+    await writeFile(jsonPath, JSON.stringify(allTweets, null, 2), "utf-8");
+    await writeFile(csvPath, toCsv(csvRows) + "\n", "utf-8");
+    await writeFile(mdPath, reportParts.join("\n\n"), "utf-8");
+  }
+
+  logRunEvent(events, { level: "info", message: "run finished", details: { tweets: allTweets.length, companies: companies.length } });
 
   await writeFile(jsonPath, JSON.stringify(allTweets, null, 2), "utf-8");
   await writeFile(csvPath, toCsv(csvRows) + "\n", "utf-8");
   await writeFile(mdPath, reportParts.join("\n\n"), "utf-8");
+  await writeRunEvents(tracePath, events);
 
   console.log(`Saved raw: ${jsonPath}`);
   console.log(`Saved csv: ${csvPath}`);
   console.log(`Saved summary: ${mdPath}`);
+  console.log(`Saved trace: ${tracePath}`);
 }
 
 async function main(): Promise<void> {

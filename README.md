@@ -21,9 +21,11 @@ pnpm company-comments --companies data/companies.example.csv
 
 - 生データ: `data/raw/*.json`
 - CSV: `data/raw/*.csv`
+- 実行トレース: `data/raw/*.trace.jsonl`
 - 要約: `data/reports/*.md`
 
 方針として、レポート本体（Markdown要約）以外はすべて `data/raw` に保存します。
+`company-latest` / `company-comments` は会社ごとに検索・リプライ取得・要約の開始/終了をトレースへ逐次保存するため、長時間実行中に止まった場合も最後に処理していた会社と段階を確認できます。
 
 会社入力ファイルはCSVまたはJSONに対応しています。
 
