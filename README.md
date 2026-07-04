@@ -4,28 +4,47 @@ X/Twitter の公開検索結果を `twitter` コマンドで取得し、ロー�
 
 ## 現在のコマンド
 
-既存の汎用的な `x search` ではなく、以下の3パターンだけを扱います。
+既存の汎用的な `x search` ではなく、以下の2パターンだけを扱います。
 
 ```bash
 # 1. codex OR "AI Agent" を人気寄り・latestで30件取得し、コメント傾向/いいね数/閲覧数つきCSVと日本語説明レポートを作る
 pnpm ai-trend
 
-# 2. 企業名 AND 企業コードで最新情報を拾い、コメント内容も含めて要約する
+# 2. 企業名 AND 企業コードで最新情報・コメント内容を一緒に要約する
 pnpm company-latest --companies data/companies.example.csv
 
-# 3. 企業名 AND 企業コードでコメント/リプライ内容の要約を重視する
-pnpm company-comments --companies data/companies.example.csv
+# 感情分析APIも使う場合（任意）
+pnpm company-latest --companies data/companies.example.csv --sentiment
+
 ```
 
 出力先:
 
 - 生データ: `data/raw/*.json`
 - CSV: `data/raw/*.csv`
+  - 投稿明細: `data/raw/company-latest-YYYY-MM-DD.csv`
+  - コメント明細: `data/raw/company-latest-YYYY-MM-DD-comments.csv`
+  - AI要約: `data/raw/company-latest-YYYY-MM-DD-summary.csv`
 - 実行トレース: `data/raw/*.trace.jsonl`
 - 要約: `data/reports/*.md`
 
 方針として、レポート本体（Markdown要約）以外はすべて `data/raw` に保存します。
-`company-latest` / `company-comments` は会社ごとに検索・リプライ取得・要約の開始/終了をトレースへ逐次保存するため、長時間実行中に止まった場合も最後に処理していた会社と段階を確認できます。
+`company-latest` は会社CSV/JSONの各行（企業）を `--company-concurrency` の数だけ並列処理します。会社ごとの検索・リプライ取得・要約の開始/終了をトレースへ逐次保存するため、長時間実行中に止まった場合も処理中だった会社と段階を確認できます。
+`--with-replies` または `--replies-per-tweet` を指定した場合、各対象ツイートに対して `twitter tweet <ツイートID> -n <件数> --json --full-text` を実行し、取得コメント/リプライを `data/raw/company-latest-YYYY-MM-DD-comments.json` と `.csv` に別rawとして保存します。AI要約の `コメント要約` と `コメント感情スコア` は、このコメントrawを参考にします。
+会社別Markdownは `data/reports/company-latest-YYYY-MM-DD-<code>-<name>.md` のように1社1ファイルで保存し、一覧用に `data/reports/company-latest-YYYY-MM-DD-index.md` を作ります。
+
+会社別MarkdownとAI要約CSVは、以下の固定項目で出力します。
+
+- 会社名
+- 会社コード
+- ツイート要約（100字以内）
+- コメント要約（100字以内）
+- 投資判断の課題
+- 投資判断のヒント
+- ツイート感情スコア
+- コメント感情スコア
+
+加えて、会社別Markdownには表の後に `# 要約の根拠` セクションを出力します。表には根拠カラムを置かず、ツイート要約・コメント要約・投資判断の課題/ヒントに関する根拠URLや判断理由は `# 要約の根拠` とAI要約CSVの `summaryEvidence` 列へ集約します。リンクと明確に紐付けられない場合は、無理に説明せず `不明` または `正確ではない可能性があります` と短く出します。
 
 会社入力ファイルはCSVまたはJSONに対応しています。
 
@@ -39,8 +58,7 @@ name,code
 
 ```bash
 pnpm start -- ai-trend --limit 30 --min-likes 0 --max-likes 100 --min-retweets 0 --replies-per-tweet 5
-pnpm start -- company-latest --companies data/companies.csv --limit-per-company 10 --min-likes 0 --max-likes 100 --min-retweets 0 --replies-per-tweet 3
-pnpm start -- company-comments --companies data/companies.csv --limit-per-company 5 --min-likes 0 --max-likes 100 --min-retweets 0 --replies-per-tweet 10
+pnpm start -- company-latest --companies data/companies.csv --limit-per-company 10 --company-concurrency 3 --min-likes 0 --max-likes 100 --min-retweets 0 --with-replies --replies-per-tweet 10 --sentiment
 ```
 
 人気度の調整:
@@ -48,6 +66,10 @@ pnpm start -- company-comments --companies data/companies.csv --limit-per-compan
 - `--min-likes`: いいね数の下限。未指定なら0。
 - `--max-likes`: いいね数の上限。未指定なら上限なし。
 - `--min-retweets`: リツイート数の下限。未指定なら0。
+
+- `--company-concurrency`: `company-latest` の会社単位並列数。未指定なら3。X検索・Ollama要約の負荷が高い場合は1〜2に下げます。
+- `--sentiment`: 任意。指定した場合だけ、X検索結果本文と、`--with-replies` 有効時は取得リプライ本文を `http://127.0.0.1:8000/analyze` にPOSTして、ツイート感情スコアとコメント感情スコアを別々に出します。
+- `--sentiment-url`: 任意。感情分析APIのURL。未指定なら `http://127.0.0.1:8000/analyze`。APIレスポンスは `score`（-1〜1、ポジティブ最高1/ネガティブ最低-1）を含む想定です。出力では `0〜100` に変換します。
 
 事前確認だけしたい場合は `--dry-run` を付けます。
 
@@ -760,3 +782,117 @@ ollama pull qwen3:8b
 - 生データを保存できる
 - LLMの出力が怪しい場合に元データを確認できる
 - ローカルLLMの学習に向いている
+
+## pnpm コマンド早見表
+
+`package.json` で指定している pnpm script は以下です。
+
+| コマンド | 用途 |
+| --- | --- |
+| `pnpm start -- <command> [options]` | 汎用入口。`ai-trend` / `company-latest` を明示して実行します。 |
+| `pnpm ai-trend [options]` | `codex OR "AI Agent"` のX検索結果を取得し、AIトレンド要約を作成します。 |
+| `pnpm company-latest --companies <csv-or-json> [options]` | 会社一覧を読み、会社ごとのX検索・要約・会社別Markdown・CSVを作成します。 |
+| `pnpm typecheck` | TypeScriptの型チェックを実行します。 |
+
+### `pnpm start` から実行する場合
+
+```bash
+# AIトレンド
+pnpm start -- ai-trend --limit 30
+
+# 会社別最新情報
+pnpm start -- company-latest --companies data/companies.csv --limit-per-company 10
+```
+
+### script alias から実行する場合
+
+```bash
+# package.json の ai-trend script は --limit 30 を含みます
+pnpm ai-trend
+
+# company-latest は追加オプションをそのまま渡せます
+pnpm company-latest --companies data/companies.csv --limit-per-company 10
+```
+
+### 会社別レポートの主なオプション
+
+```bash
+pnpm company-latest \
+  --companies data/companies.csv \
+  --limit-per-company 10 \
+  --company-concurrency 1 \
+  --with-replies \
+  --replies-per-tweet 10 \
+  --min-likes 0 \
+  --max-likes 100 \
+  --min-retweets 0 \
+  --sentiment \
+  --sentiment-url http://127.0.0.1:8000/analyze
+```
+
+| オプション | 意味 | 既定値 |
+| --- | --- | --- |
+| `--companies` | 会社一覧CSV/JSON。必須です。CSVは `name,code` または `企業名,企業コード` に対応します。 | なし |
+| `--limit-per-company` | 会社ごとに要約対象にする投稿数。 | `10` |
+| `--company-concurrency` | 会社単位の並列数。重い場合は `1` 推奨です。 | `3` |
+| `--with-replies` | 指定した場合だけリプライ取得を行います。未指定なら投稿本文のみで要約します。 | false |
+| `--replies-per-tweet` | `--with-replies` 指定時に、各投稿から取得するリプライ数。互換性のため、このオプションだけ指定した場合もリプライ取得を有効化します。 | `10` |
+| `--min-likes` | いいね数の下限。 | `0` |
+| `--max-likes` | いいね数の上限。未指定なら上限なし。 | なし |
+| `--min-retweets` | リポスト数の下限。 | `0` |
+| `--sentiment` | 指定した場合だけ感情分析APIを呼びます。 | 未実行 |
+| `--sentiment-url` | 感情分析APIのURL。`score` が `-1`〜`1` で返る想定です。 | `http://127.0.0.1:8000/analyze` |
+| `--out-dir` | 出力先ディレクトリ。 | `data` |
+| `--dry-run` | 取得・要約・保存はせず、読み込む会社数と検索クエリだけ確認します。 | false |
+
+### X/Twitter rate limit 対策
+
+`twitter` CLI が `Rate limited (429)` を返した場合は、サーバーへ連続負荷をかけないように自動でsleepしてから再試行します。
+
+既定値:
+
+- 最大試行回数: `3`
+- 429時のsleep: `60秒`
+
+必要なら環境変数で調整できます。
+
+```bash
+TWITTER_RATE_LIMIT_SLEEP_MS=120000 TWITTER_RATE_LIMIT_MAX_ATTEMPTS=3 \
+  pnpm company-latest --companies data/companies.csv --limit-per-company 10 --company-concurrency 1
+```
+
+| 環境変数 | 意味 | 既定値 |
+| --- | --- | --- |
+| `TWITTER_RATE_LIMIT_SLEEP_MS` | 429発生時に次のretryまで待つミリ秒。 | `60000` |
+| `TWITTER_RATE_LIMIT_MAX_ATTEMPTS` | 429発生時の最大試行回数。 | `3` |
+
+429が頻発する場合は `--company-concurrency 1`、リプライ取得なし（`--with-replies` を付けない）、必要な場合だけ `--with-replies --replies-per-tweet 1〜3`、`TWITTER_RATE_LIMIT_SLEEP_MS=120000` 以上を推奨します。
+
+### 重いときの推奨実行例
+
+まずは軽い設定で動作確認します。
+
+```bash
+pnpm company-latest --companies data/companies.csv --limit-per-company 1 --company-concurrency 1
+```
+
+問題なければ、少しずつ増やします。
+
+```bash
+pnpm company-latest --companies data/companies.csv --limit-per-company 10 --with-replies --replies-per-tweet 3 --company-concurrency 1
+```
+
+### 出力先
+
+`--out-dir` を指定しない場合、以下に保存します。
+
+```text
+data/raw/company-latest-YYYY-MM-DD.json
+data/raw/company-latest-YYYY-MM-DD.csv
+data/raw/company-latest-YYYY-MM-DD-comments.json
+data/raw/company-latest-YYYY-MM-DD-comments.csv
+data/raw/company-latest-YYYY-MM-DD-summary.csv
+data/raw/company-latest-YYYY-MM-DD.trace.jsonl
+data/reports/company-latest-YYYY-MM-DD-index.md
+data/reports/company-latest-YYYY-MM-DD-<code>-<name>.md
+```

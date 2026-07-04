@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -7,9 +7,13 @@ const execFileAsync = promisify(execFile);
 const OLLAMA_MODEL = "qwen3:8b";
 const OLLAMA_URL = "http://localhost:11434/api/chat";
 const TWITTER_COMMAND_TIMEOUT_MS = 120_000;
+const TWITTER_RATE_LIMIT_MAX_ATTEMPTS = Number(process.env.TWITTER_RATE_LIMIT_MAX_ATTEMPTS ?? 3);
+const TWITTER_RATE_LIMIT_SLEEP_MS = Number(process.env.TWITTER_RATE_LIMIT_SLEEP_MS ?? 60_000);
 const OLLAMA_TIMEOUT_MS = 300_000;
+const DEFAULT_SENTIMENT_URL = "http://127.0.0.1:8000/analyze";
+const SENTIMENT_TIMEOUT_MS = 30_000;
 
-type Command = "ai-trend" | "company-latest" | "company-comments";
+type Command = "ai-trend" | "company-latest";
 
 type Tweet = {
   id: string;
@@ -46,6 +50,10 @@ type Reply = {
   };
   metrics?: Tweet["metrics"];
   createdAtISO?: string;
+  parentTweetId?: string;
+  parentTweetUrl?: string;
+  companyName?: string;
+  companyCode?: string;
 };
 
 type TwitterSearchResponse = {
@@ -56,10 +64,12 @@ type TwitterSearchResponse = {
 
 type TwitterTweetResponse = {
   ok?: boolean;
-  data?: {
-    tweet?: Tweet;
-    replies?: Reply[];
-  };
+  data?:
+    | Array<Tweet | Reply>
+    | {
+        tweet?: Tweet;
+        replies?: Reply[];
+      };
   tweet?: Tweet;
   replies?: Reply[];
 };
@@ -85,17 +95,40 @@ type RunEvent = {
   details?: Record<string, unknown>;
 };
 
+type CompanySummary = {
+  companyName: string;
+  companyCode: string;
+  tweetSummary: string;
+  commentSummary: string;
+  investmentIssues: string;
+  investmentHints: string;
+  summaryEvidence: string;
+};
+
+type SentimentSummary = {
+  enabled: boolean;
+  score0To100?: number;
+  averageRawScore?: number;
+  analyzedCount: number;
+  failedCount: number;
+  error?: string;
+};
+
+type SentimentResponse = {
+  score?: number;
+  sentiment?: { score?: number };
+  result?: { score?: number };
+};
+
 function usage(exitCode = 0): never {
   const text = `
 Usage:
   pnpm start -- ai-trend [--limit 30] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--replies-per-tweet 5] [--dry-run]
-  pnpm start -- company-latest --companies data/companies.csv [--limit-per-company 10] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--replies-per-tweet 3] [--dry-run]
-  pnpm start -- company-comments --companies data/companies.csv [--limit-per-company 5] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--replies-per-tweet 10] [--dry-run]
+  pnpm start -- company-latest --companies data/companies.csv [--limit-per-company 10] [--company-concurrency 3] [--with-replies] [--replies-per-tweet 10] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--sentiment] [--sentiment-url http://127.0.0.1:8000/analyze] [--dry-run]
 
 Patterns:
   ai-trend         codex OR "AI Agent" を人気寄り・latest で30件取得し、qwen3:8bで要約してCSV化します。
-  company-latest   企業名 AND 企業コードを会社ファイルから読み、最新情報とコメントを要約します。
-  company-comments 企業名 AND 企業コードを会社ファイルから読み、コメント/リプライ内容の要約を重視します。
+  company-latest   企業名 AND 企業コードを会社ファイルから読み、最新情報・コメント・任意の感情スコアを固定フォーマットで要約します。
 
 Company file format:
   CSV: name,code headerあり、または「企業名,企業コード」の2列。
@@ -112,7 +145,7 @@ function parseArgs(argv: string[]): { command: Command; options: Options } {
     usage(0);
   }
 
-  if (!["ai-trend", "company-latest", "company-comments"].includes(commandRaw)) {
+  if (!["ai-trend", "company-latest"].includes(commandRaw)) {
     console.error(`Unknown command: ${commandRaw}`);
     usage(1);
   }
@@ -196,7 +229,59 @@ function formatDuration(startedAtMs: number): string {
   return `${((Date.now() - startedAtMs) / 1000).toFixed(1)}s`;
 }
 
-function logRunEvent(events: RunEvent[], event: Omit<RunEvent, "at">): void {
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+type ExecLikeError = Error & { stdout?: string; stderr?: string };
+
+function errorDetails(error: unknown): string {
+  if (error instanceof Error) {
+    const execError = error as ExecLikeError;
+    return [error.message, execError.stdout, execError.stderr].filter(Boolean).join("\n");
+  }
+  return String(error);
+}
+
+function isTwitterRateLimit(text: string): boolean {
+  return /rate limited|429/i.test(text);
+}
+
+async function execTwitter(args: string[], _context: string): Promise<string> {
+  const { stdout } = await execFileAsync("twitter", args, { maxBuffer: 10 * 1024 * 1024, timeout: TWITTER_COMMAND_TIMEOUT_MS });
+  return stdout;
+}
+
+async function withTwitterRateLimitRetry<T>(context: string, operation: () => Promise<T>): Promise<T> {
+  const maxAttempts = Math.max(1, Number.isFinite(TWITTER_RATE_LIMIT_MAX_ATTEMPTS) ? TWITTER_RATE_LIMIT_MAX_ATTEMPTS : 3);
+  const sleepMs = Math.max(0, Number.isFinite(TWITTER_RATE_LIMIT_SLEEP_MS) ? TWITTER_RATE_LIMIT_SLEEP_MS : 60_000);
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await operation();
+    } catch (error) {
+      const details = errorDetails(error);
+      if (isTwitterRateLimit(details) && attempt < maxAttempts) {
+        console.warn(`WARN: twitter rate limited during ${context}. sleeping ${(sleepMs / 1000).toFixed(0)}s before retry ${attempt + 1}/${maxAttempts}`);
+        await sleep(sleepMs);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error(`twitter ${context} failed after ${maxAttempts} attempts`);
+}
+
+async function writeRunEvents(tracePath: string, events: RunEvent[]): Promise<void> {
+  await writeFile(tracePath, events.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf-8");
+}
+
+async function appendRunEvent(tracePath: string, event: RunEvent): Promise<void> {
+  await appendFile(tracePath, JSON.stringify(event) + "\n", "utf-8");
+}
+
+function logRunEvent(events: RunEvent[], event: Omit<RunEvent, "at">): RunEvent {
   const entry: RunEvent = { at: nowIso(), ...event };
   events.push(entry);
   const company = entry.company ? ` ${entry.company.name}(${entry.company.code})` : "";
@@ -205,10 +290,38 @@ function logRunEvent(events: RunEvent[], event: Omit<RunEvent, "at">): void {
   if (entry.level === "error") console.error(line);
   else if (entry.level === "warn") console.warn(line);
   else console.log(line);
+  return entry;
 }
 
-async function writeRunEvents(tracePath: string, events: RunEvent[]): Promise<void> {
-  await writeFile(tracePath, events.map((event) => JSON.stringify(event)).join("\n") + "\n", "utf-8");
+function createRunLogger(events: RunEvent[], tracePath?: string): (event: Omit<RunEvent, "at">) => Promise<void> {
+  return async (event: Omit<RunEvent, "at">) => {
+    const entry = logRunEvent(events, event);
+    if (tracePath) await appendRunEvent(tracePath, entry);
+  };
+}
+
+async function mapWithConcurrency<T, R>(items: T[], concurrency: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  });
+
+  await Promise.all(runners);
+  return results;
+}
+
+function safePathSegment(text: string): string {
+  return text
+    .normalize("NFKC")
+    .replace(/[\/:*?"<>|\s]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80) || "unknown";
 }
 
 function engagement(tweet: Tweet): number {
@@ -258,33 +371,82 @@ function compactTweet(tweet: Tweet): Record<string, unknown> {
     quotes: m.quotes ?? 0,
     views: m.views ?? 0,
     engagement: engagement(tweet),
+    fetchedCommentCount: replies.length,
     replySamples: replies.map((reply) => reply.text?.replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 5).join(" / "),
     url: tweetUrl(tweet),
   };
 }
 
+function replyUrl(reply: Reply): string {
+  if (!reply.id) return reply.parentTweetUrl ?? "";
+  const screenName = reply.author?.screenName ?? "i";
+  return `https://x.com/${screenName}/status/${reply.id}`;
+}
+
+function compactReply(reply: Reply): Record<string, unknown> {
+  const m = reply.metrics ?? {};
+  return {
+    parentTweetId: reply.parentTweetId ?? "",
+    parentTweetUrl: reply.parentTweetUrl ?? "",
+    companyName: reply.companyName ?? "",
+    companyCode: reply.companyCode ?? "",
+    createdAt: reply.createdAtISO ?? "",
+    author: reply.author?.screenName ? `@${reply.author.screenName}` : reply.author?.name ?? "",
+    text: (reply.text ?? "").replace(/\s+/g, " ").trim(),
+    likes: m.likes ?? 0,
+    retweets: m.retweets ?? 0,
+    replies: m.replies ?? 0,
+    quotes: m.quotes ?? 0,
+    views: m.views ?? 0,
+    url: replyUrl(reply),
+  };
+}
+
+function flattenReplies(tweets: Tweet[]): Reply[] {
+  return tweets.flatMap((tweet) =>
+    (tweet.replies ?? []).map((reply) => ({
+      ...reply,
+      parentTweetId: tweet.id,
+      parentTweetUrl: tweetUrl(tweet),
+      companyName: tweet.companyName,
+      companyCode: tweet.companyCode,
+    })),
+  );
+}
+
 async function searchTwitter(query: string, max: number, type: "latest" | "top" = "latest"): Promise<Tweet[]> {
   const args = ["search", query, "--type", type, "-n", String(max), "--json", "--full-text"];
-  const { stdout } = await execFileAsync("twitter", args, { maxBuffer: 10 * 1024 * 1024, timeout: TWITTER_COMMAND_TIMEOUT_MS });
-  const json = JSON.parse(stdout) as TwitterSearchResponse;
+  return withTwitterRateLimitRetry(`search ${query}`, async () => {
+    const stdout = await execTwitter(args, `search ${query}`);
+    const json = JSON.parse(stdout) as TwitterSearchResponse;
 
-  if (!json.ok) {
-    throw new Error(`twitter search failed: ${JSON.stringify(json.error ?? json, null, 2)}`);
+    if (!json.ok) {
+      throw new Error(`twitter search failed: ${JSON.stringify(json.error ?? json, null, 2)}`);
+    }
+
+    return json.data ?? [];
+  });
+}
+
+function extractTweetReplies(json: TwitterTweetResponse, parentTweetId: string): Reply[] {
+  if (Array.isArray(json.data)) {
+    return json.data
+      .filter((item) => item.id && item.id !== parentTweetId)
+      .map((item) => item as Reply);
   }
-
-  return json.data ?? [];
+  if (json.data && !Array.isArray(json.data) && "replies" in json.data) return json.data.replies ?? [];
+  return json.replies ?? [];
 }
 
 async function fetchReplies(tweetId: string, max: number): Promise<Reply[]> {
   if (max <= 0) return [];
 
   try {
-    const { stdout } = await execFileAsync("twitter", ["tweet", tweetId, "-n", String(max), "--json", "--full-text"], {
-      maxBuffer: 10 * 1024 * 1024,
-      timeout: TWITTER_COMMAND_TIMEOUT_MS,
+    return await withTwitterRateLimitRetry(`tweet ${tweetId}`, async () => {
+      const stdout = await execTwitter(["tweet", tweetId, "-n", String(max), "--json", "--full-text"], `tweet ${tweetId}`);
+      const json = JSON.parse(stdout) as TwitterTweetResponse;
+      return extractTweetReplies(json, tweetId);
     });
-    const json = JSON.parse(stdout) as TwitterTweetResponse;
-    return json.data?.replies ?? json.replies ?? [];
   } catch (error) {
     console.warn(`WARN: failed to fetch replies for ${tweetId}: ${error instanceof Error ? error.message : String(error)}`);
     return [];
@@ -301,7 +463,7 @@ async function withReplies(tweets: Tweet[], maxReplies: number): Promise<Tweet[]
   return enriched;
 }
 
-async function callOllama(system: string, prompt: string): Promise<string> {
+async function callOllama(system: string, prompt: string, jsonMode = false): Promise<string> {
   const res = await fetch(OLLAMA_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -310,7 +472,8 @@ async function callOllama(system: string, prompt: string): Promise<string> {
       model: OLLAMA_MODEL,
       stream: false,
       think: false,
-      options: { temperature: 0.2, num_predict: 1200 },
+      ...(jsonMode ? { format: "json" } : {}),
+      options: { temperature: 0.2, num_predict: jsonMode ? 4096 : 1200 },
       messages: [
         { role: "system", content: system },
         { role: "user", content: `/no_think\n${prompt}` },
@@ -351,14 +514,247 @@ async function summarizeAiTrend(tweets: Tweet[]): Promise<string> {
   );
 }
 
-async function summarizeCompany(company: Company, tweets: Tweet[], focusComments: boolean): Promise<string> {
-  return callOllama(
-    systemPrompt(),
-    `企業名「${company.name}」と企業コード「${company.code}」のAND検索結果です。\n` +
-      `最新情報をピックアップし、${focusComments ? "コメント/リプライ内容を重視して" : "コメント/リプライ内容も含めて"}要約してください。\n` +
-      `出力は「要点」「確認できた材料」「コメント傾向」「投資判断には使えない未確認点」「次に確認する情報源」に分けてください。\n\n` +
-      JSON.stringify(tweets.map(compactTweet), null, 2),
-  );
+function truncateText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length > maxChars ? `${normalized.slice(0, maxChars - 1)}…` : normalized;
+}
+
+function compactTweetForSummary(tweet: Tweet): Record<string, unknown> {
+  const compact = compactTweet(tweet);
+  return {
+    ...compact,
+    text: truncateText(String(compact.text), 220),
+    replySamples: truncateText(String(compact.replySamples), 240),
+  };
+}
+
+function compactReplyForSummary(reply: Reply): Record<string, unknown> {
+  const compact = compactReply(reply);
+  return {
+    ...compact,
+    text: truncateText(String(compact.text), 220),
+  };
+}
+
+function formatTweetEvidence(tweet: Tweet): string {
+  const m = tweet.metrics ?? {};
+  return `${truncateText(tweet.text, 80)}（likes=${m.likes ?? 0}, retweets=${m.retweets ?? 0}, replies=${m.replies ?? 0}, Xリンク: ${tweetUrl(tweet)}）`;
+}
+
+function deterministicCompanySummary(company: Company, tweets: Tweet[], comments: Reply[] = [], reason?: string): CompanySummary {
+  const rankedTweets = [...tweets].sort((a, b) => engagement(b) - engagement(a)).slice(0, 3);
+  const rankedComments = [...comments]
+    .filter((comment) => (comment.text ?? "").trim())
+    .sort((a, b) => ((b.metrics?.likes ?? 0) + (b.metrics?.retweets ?? 0) * 2) - ((a.metrics?.likes ?? 0) + (a.metrics?.retweets ?? 0) * 2))
+    .slice(0, 5);
+  const tweetEvidenceLines = rankedTweets.map((tweet, index) => `- ツイート${index + 1}: ${formatTweetEvidence(tweet)}`);
+  const commentEvidenceLines = rankedComments.map((comment, index) => `- コメント${index + 1}: ${truncateText(comment.text ?? "", 90)}（likes=${comment.metrics?.likes ?? 0}, Xリンク: ${replyUrl(comment) || comment.parentTweetUrl || "不明"}）`);
+  const evidenceLines = [...tweetEvidenceLines, ...commentEvidenceLines];
+  const reasonNote = reason ? `AI要約が不安定だったため、取得済み投稿・コメントrawから機械的に生成しました（${reason}）。` : "取得済み投稿・コメントrawから機械的に生成しました。";
+
+  const tweetSummary = rankedTweets.length > 0
+    ? truncateText(rankedTweets.map((tweet) => truncateText(tweet.text, 45)).join(" / "), 100)
+    : "不明";
+  const commentSummary = rankedComments.length > 0
+    ? truncateText(rankedComments.map((comment) => truncateText(comment.text ?? "", 35)).join(" / "), 100)
+    : "取得コメントなし";
+
+  return {
+    companyName: company.name,
+    companyCode: company.code,
+    tweetSummary,
+    commentSummary,
+    investmentIssues: "X投稿とコメントだけでは業績、適時開示、決算、需給、ニュース原文を確認できません。投資判断には一次情報の確認が必要です。",
+    investmentHints: rankedTweets.length > 0 || rankedComments.length > 0 ? "反応が大きい投稿・コメントのURL、投稿日時、指標を起点に、会社開示・ニュース原文・株価出来高を確認してください。" : "検索条件を広げるか、企業名・証券コードを確認してください。",
+    summaryEvidence: [`- 要約: ${reasonNote}`, ...evidenceLines].join("\n"),
+  };
+}
+
+function normalizeSummaryField(value: unknown, fallback = "不明", maxChars?: number): string {
+  const text = typeof value === "string" ? value.trim() : "";
+  const normalized = text.length > 0 ? text : fallback;
+  return maxChars === undefined ? normalized : truncateText(normalized, maxChars);
+}
+
+function isUnknownSummary(summary: CompanySummary): boolean {
+  const fields = [summary.tweetSummary, summary.commentSummary, summary.investmentIssues, summary.investmentHints, summary.summaryEvidence];
+  return fields.every((field) => /^(不明|取得コメントなし|正確ではない可能性があります)\s*$/u.test(field.trim()));
+}
+
+function parseCompanySummary(company: Company, text: string, tweets: Tweet[], comments: Reply[]): CompanySummary {
+  const cleaned = text.trim().replace(/^```(?:json)?/i, "").replace(/```$/i, "").trim();
+  try {
+    const parsed = JSON.parse(cleaned) as Partial<CompanySummary>;
+    const summary = {
+      companyName: company.name,
+      companyCode: company.code,
+      tweetSummary: normalizeSummaryField(parsed.tweetSummary ?? parsed["ツイート要約" as keyof CompanySummary] ?? parsed["tweet要約" as keyof CompanySummary], "不明", 100),
+      commentSummary: normalizeSummaryField(parsed.commentSummary ?? parsed["コメント要約" as keyof CompanySummary], comments.length > 0 ? "不明" : "取得コメントなし", 100),
+      investmentIssues: normalizeSummaryField(parsed.investmentIssues ?? parsed["投資判断の課題" as keyof CompanySummary]),
+      investmentHints: normalizeSummaryField(parsed.investmentHints ?? parsed["投資判断のヒント" as keyof CompanySummary]),
+      summaryEvidence: normalizeSummaryField(parsed.summaryEvidence ?? parsed["要約の根拠" as keyof CompanySummary]),
+    };
+    if (isUnknownSummary(summary)) {
+      console.warn(`WARN: company summary JSON was uninformative for ${company.name}(${company.code}); using deterministic fallback summary`);
+      return deterministicCompanySummary(company, tweets, comments, "AI要約が不明のみを返しました");
+    }
+    return summary;
+  } catch (error) {
+    const message = errorMessage(error);
+    console.warn(`WARN: company summary JSON was invalid for ${company.name}(${company.code}); using deterministic fallback summary: ${message}`);
+    return deterministicCompanySummary(company, tweets, comments, message);
+  }
+}
+
+function cleanLlmSummary(text: string, fallback: string): string {
+  const cleaned = text
+    .trim()
+    .replace(/^```(?:json|markdown)?/i, "")
+    .replace(/```$/i, "")
+    .replace(/^[-*]\s*/, "")
+    .replace(/^要約[:：]\s*/, "")
+    .replace(/\*\*/g, "")
+    .trim();
+  if (!cleaned || /^(不明|なし|null)$/i.test(cleaned)) return fallback;
+  if (/以下は|提供された|整理した|分析です|参考になります|^#+\s|---/.test(cleaned)) return fallback;
+  return truncateText(cleaned, 100);
+}
+
+async function summarizeTextGroup(label: "ツイート" | "コメント", rows: Array<Record<string, unknown>>, fallback: string): Promise<string> {
+  const texts = rows
+    .map((row) => String(row.text ?? "").replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  if (texts.length === 0) return fallback;
+  try {
+    const response = await callOllama(
+      systemPrompt(),
+      `${label}本文に何が書かれているかだけを、日本語100字以内で要約してください。\n` +
+        `投資分析、外部知識、日付の推測、前置きは禁止です。\n` +
+        `「以下は」「提供された」「分析」「参考」のようなメタ説明は禁止です。\n` +
+        `箇条書き・Markdown・JSONは禁止。要約文だけを1文で返してください。\n\n` +
+        JSON.stringify(texts, null, 2),
+      false,
+    );
+    return cleanLlmSummary(response, fallback);
+  } catch (error) {
+    console.warn(`WARN: failed to summarize ${label}; using deterministic fallback summary: ${errorMessage(error)}`);
+    return fallback;
+  }
+}
+
+async function summarizeCompany(company: Company, tweets: Tweet[], comments: Reply[]): Promise<CompanySummary> {
+  const fallback = deterministicCompanySummary(company, tweets, comments, tweets.length === 0 ? "対象投稿なし" : undefined);
+  if (tweets.length === 0) return fallback;
+
+  const tweetSummary = await summarizeTextGroup("ツイート", tweets.map(compactTweetForSummary), fallback.tweetSummary);
+  const commentSummary = await summarizeTextGroup("コメント", comments.map(compactReplyForSummary), fallback.commentSummary);
+
+  return {
+    ...fallback,
+    tweetSummary,
+    commentSummary,
+  };
+}
+
+function tweetTexts(tweets: Tweet[]): string[] {
+  return tweets
+    .map((tweet) => tweet.text.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+function replyTexts(comments: Reply[]): string[] {
+  return comments
+    .map((reply) => (reply.text ?? "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+}
+
+function extractSentimentScore(json: SentimentResponse): number | undefined {
+  const score = json.score ?? json.sentiment?.score ?? json.result?.score;
+  return typeof score === "number" && Number.isFinite(score) ? Math.max(-1, Math.min(1, score)) : undefined;
+}
+
+async function analyzeSentiment(texts: string[], sentimentUrl: string): Promise<SentimentSummary> {
+  if (texts.length === 0) return { enabled: true, analyzedCount: 0, failedCount: 0, error: "分析対象コメントなし" };
+
+  const scores: number[] = [];
+  let failedCount = 0;
+  for (const text of texts) {
+    try {
+      const res = await fetch(sentimentUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(SENTIMENT_TIMEOUT_MS),
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(`sentiment API error: ${res.status} ${await res.text()}`);
+      const score = extractSentimentScore((await res.json()) as SentimentResponse);
+      if (score === undefined) throw new Error("sentiment API response does not include score");
+      scores.push(score);
+    } catch (error) {
+      failedCount += 1;
+      console.warn(`WARN: failed to analyze sentiment: ${errorMessage(error)}`);
+    }
+  }
+
+  if (scores.length === 0) {
+    return { enabled: true, analyzedCount: 0, failedCount, error: "有効な感情スコアなし" };
+  }
+
+  const averageRawScore = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+  const score0To100 = Math.round((averageRawScore + 1) * 50);
+  return { enabled: true, score0To100, averageRawScore: Number(averageRawScore.toFixed(4)), analyzedCount: scores.length, failedCount };
+}
+
+function formatSentiment(sentiment: SentimentSummary): string {
+  if (!sentiment.enabled) return "未実行（--sentiment 未指定）";
+  if (sentiment.score0To100 === undefined) return `不明（${sentiment.error ?? "スコアなし"}、成功${sentiment.analyzedCount}件/失敗${sentiment.failedCount}件）`;
+  return `${sentiment.score0To100}/100（平均raw=${sentiment.averageRawScore}、成功${sentiment.analyzedCount}件/失敗${sentiment.failedCount}件）`;
+}
+
+function markdownTableCell(value: unknown): string {
+  return String(value ?? "")
+    .replace(/\r?\n/g, "<br>")
+    .replace(/\|/g, "\\|");
+}
+
+function sourceUrls(tweets: Tweet[]): string[] {
+  return [...new Set(tweets.map(tweetUrl).filter(Boolean))];
+}
+
+function completeSummaryEvidence(summaryEvidence: string, tweets: Tweet[]): string {
+  const cleaned = summaryEvidence.trim();
+  if (cleaned.length > 0) return cleaned;
+
+  const urls = sourceUrls(tweets).slice(0, 5);
+  if (urls.length === 0) return "不明";
+  return ["取得済みX投稿URL:", ...urls.map((url) => `- ${url}`)].join("\n");
+}
+
+function formatCompanyReport(summary: CompanySummary, tweetSentiment: SentimentSummary, commentSentiment: SentimentSummary, tweets: Tweet[]): string {
+  const completedSummaryEvidence = completeSummaryEvidence(summary.summaryEvidence, tweets);
+  const headers = ["会社名", "会社コード", "ツイート要約", "コメント要約", "投資判断の課題", "投資判断のヒント", "ツイート感情スコア", "コメント感情スコア"];
+  const values = [
+    summary.companyName,
+    summary.companyCode,
+    summary.tweetSummary,
+    summary.commentSummary,
+    summary.investmentIssues,
+    summary.investmentHints,
+    formatSentiment(tweetSentiment),
+    formatSentiment(commentSentiment),
+  ];
+  return [
+    `# ${summary.companyName} (${summary.companyCode})`,
+    "",
+    `| ${headers.join(" | ")} |`,
+    `| ${headers.map(() => "---").join(" | ")} |`,
+    `| ${values.map(markdownTableCell).join(" | ")} |`,
+    "",
+    "# 要約の根拠",
+    "",
+    completedSummaryEvidence,
+  ].join("\n");
 }
 
 function parseCsvLine(line: string): string[] {
@@ -415,7 +811,7 @@ async function runAiTrend(options: Options): Promise<void> {
   const repliesPerTweet = optionNumber(options, "replies-per-tweet", 5);
   const dryRun = options["dry-run"] === true;
   const outDir = optionString(options, "out-dir", "data") ?? "data";
-  const query = `(codex OR "AI Agent") -filter:retweets`;
+  const query = `(codex OR "AI Agent") -filter:nativeretweets -filter:links min_retweets:5 min_faves:10`;
 
   console.log(`Query: ${query}`);
   console.log(`Mode: latest + post-sort by engagement, limit=${limit}, ${describePopularity(minLikes, maxLikes, minRetweets)}`);
@@ -448,15 +844,172 @@ async function runAiTrend(options: Options): Promise<void> {
   console.log(`Saved summary: ${mdPath}`);
 }
 
-async function runCompany(options: Options, focusComments: boolean): Promise<void> {
+type CompanyResult = {
+  company: Company;
+  tweets: Tweet[];
+  comments: Reply[];
+  csvRows: Array<Record<string, unknown>>;
+  commentRows: Array<Record<string, unknown>>;
+  reportPath: string;
+  reportBody: string;
+  summaryRow: Record<string, unknown>;
+  error?: string;
+};
+
+async function processCompany(params: {
+  company: Company;
+  index: number;
+  total: number;
+  prefix: string;
+  stamp: string;
+  reportsDir: string;
+  limitPerCompany: number;
+  minLikes: number;
+  maxLikes?: number;
+  minRetweets: number;
+  repliesPerTweet: number;
+  sentimentEnabled: boolean;
+  sentimentUrl: string;
+  log: (event: Omit<RunEvent, "at">) => Promise<void>;
+}): Promise<CompanyResult> {
+  const {
+    company,
+    index,
+    total,
+    prefix,
+    stamp,
+    reportsDir,
+    limitPerCompany,
+    minLikes,
+    maxLikes,
+    minRetweets,
+    repliesPerTweet,
+    sentimentEnabled,
+    sentimentUrl,
+    log,
+  } = params;
+  const companyStartedAt = Date.now();
+  const query = `"${company.name}" ${company.code} -filter:nativeretweets`;
+  const reportPath = path.join(reportsDir, `${prefix}-${stamp}-${safePathSegment(company.code)}-${safePathSegment(company.name)}.md`);
+
+  await log({
+    level: "info",
+    message: "company started",
+    company,
+    details: { index: index + 1, total, query },
+  });
+
+  try {
+    await log({ level: "info", message: "search started", company, details: { max: Math.max(limitPerCompany * 3, limitPerCompany) } });
+    const searched = await searchTwitter(query, Math.max(limitPerCompany * 3, limitPerCompany), "latest");
+    await log({ level: "info", message: "search finished", company, details: { count: searched.length } });
+
+    const filtered = searched
+      .filter((tweet) => matchesPopularity(tweet, minLikes, maxLikes, minRetweets))
+      .sort((a, b) => engagement(b) - engagement(a) || String(b.createdAtISO ?? "").localeCompare(String(a.createdAtISO ?? "")))
+      .slice(0, limitPerCompany);
+    if (filtered.length === 0) {
+      await log({ level: "warn", message: "popularity filters matched 0 tweets", company });
+    }
+
+    await log({ level: "info", message: "replies fetch started", company, details: { tweets: filtered.length, repliesPerTweet } });
+    const tweets = (await withReplies(filtered, repliesPerTweet)).map((tweet) => ({ ...tweet, companyName: company.name, companyCode: company.code, searchQuery: query }));
+    const comments = flattenReplies(tweets);
+    await log({ level: "info", message: "replies fetched", company, details: { tweets: tweets.length, comments: comments.length, repliesPerTweet } });
+
+    await log({ level: "info", message: "summary started", company, details: { tweets: tweets.length, comments: comments.length } });
+    const summary = await summarizeCompany(company, tweets, comments);
+    const tweetSentiment = sentimentEnabled
+      ? await analyzeSentiment(tweetTexts(tweets), sentimentUrl)
+      : { enabled: false, analyzedCount: 0, failedCount: 0 };
+    const commentSentiment = sentimentEnabled
+      ? await analyzeSentiment(replyTexts(comments), sentimentUrl)
+      : { enabled: false, analyzedCount: 0, failedCount: 0 };
+    const completedSummaryEvidence = completeSummaryEvidence(summary.summaryEvidence, tweets);
+    const reportBody = formatCompanyReport(summary, tweetSentiment, commentSentiment, tweets);
+    await writeFile(reportPath, reportBody, "utf-8");
+    await log({ level: "info", message: "summary finished", company, details: { duration: formatDuration(companyStartedAt), reportPath, tweetSentiment: formatSentiment(tweetSentiment), commentSentiment: formatSentiment(commentSentiment) } });
+
+    return {
+      company,
+      tweets,
+      comments,
+      csvRows: tweets.map((tweet) => ({ companyName: company.name, companyCode: company.code, ...compactTweet(tweet) })),
+      commentRows: comments.map(compactReply),
+      reportPath,
+      reportBody,
+      summaryRow: {
+        companyName: summary.companyName,
+        companyCode: summary.companyCode,
+        tweetSummary: summary.tweetSummary,
+        commentSummary: summary.commentSummary,
+        investmentIssues: summary.investmentIssues,
+        investmentHints: summary.investmentHints,
+        summaryEvidence: completedSummaryEvidence,
+        tweetCount: tweets.length,
+        commentCount: comments.length,
+        tweetSentimentScore: formatSentiment(tweetSentiment),
+        tweetSentimentScore0To100: tweetSentiment.score0To100 ?? "",
+        tweetSentimentAverageRawScore: tweetSentiment.averageRawScore ?? "",
+        tweetSentimentAnalyzedCount: tweetSentiment.analyzedCount,
+        tweetSentimentFailedCount: tweetSentiment.failedCount,
+        commentSentimentScore: formatSentiment(commentSentiment),
+        commentSentimentScore0To100: commentSentiment.score0To100 ?? "",
+        commentSentimentAverageRawScore: commentSentiment.averageRawScore ?? "",
+        commentSentimentAnalyzedCount: commentSentiment.analyzedCount,
+        commentSentimentFailedCount: commentSentiment.failedCount,
+      },
+    };
+  } catch (error) {
+    const message = errorMessage(error);
+    await log({ level: "error", message: "company failed; continuing with remaining companies", company, details: { error: message } });
+    const reportBody = [
+      `# ${company.name} (${company.code})`,
+      "",
+      "この企業の処理は失敗しました。",
+      "",
+      `- エラー: ${message}`,
+      `- クエリ: ${query}`,
+      "- 詳細: trace JSONL を確認してください。",
+    ].join("\n");
+    await writeFile(reportPath, reportBody, "utf-8");
+    return {
+      company,
+      tweets: [],
+      comments: [],
+      csvRows: [],
+      commentRows: [],
+      reportPath,
+      reportBody,
+      summaryRow: {
+        companyName: company.name,
+        companyCode: company.code,
+        tweetSummary: "処理失敗",
+        commentSummary: "不明",
+        investmentIssues: "trace JSONL を確認してください。",
+        investmentHints: "不明",
+        summaryEvidence: message,
+        tweetSentimentScore: "不明",
+        commentSentimentScore: "不明",
+      },
+      error: message,
+    };
+  }
+}
+
+async function runCompany(options: Options): Promise<void> {
   const companiesPath = optionString(options, "companies");
   if (!companiesPath) throw new Error("--companies is required");
 
-  const limitPerCompany = optionNumber(options, "limit-per-company", focusComments ? 5 : 10);
+  const limitPerCompany = optionNumber(options, "limit-per-company", 10);
+  const companyConcurrency = Math.max(1, optionNumber(options, "company-concurrency", 3));
   const minLikes = optionNumber(options, "min-likes", 0);
   const maxLikes = optionalNumber(options, "max-likes");
   const minRetweets = optionNumber(options, "min-retweets", 0);
-  const repliesPerTweet = optionNumber(options, "replies-per-tweet", focusComments ? 10 : 3);
+  const repliesEnabled = options["with-replies"] === true || options["replies"] === true || options["replies-per-tweet"] !== undefined;
+  const repliesPerTweet = repliesEnabled ? optionNumber(options, "replies-per-tweet", 10) : 0;
+  const sentimentEnabled = options["sentiment"] === true;
+  const sentimentUrl = optionString(options, "sentiment-url", DEFAULT_SENTIMENT_URL) ?? DEFAULT_SENTIMENT_URL;
   const dryRun = options["dry-run"] === true;
   const outDir = optionString(options, "out-dir", "data") ?? "data";
   const companies = await readCompanies(companiesPath);
@@ -465,9 +1018,9 @@ async function runCompany(options: Options, focusComments: boolean): Promise<voi
   if (companies.length === 0) throw new Error(`No companies found: ${companiesPath}`);
 
   console.log(`Companies: ${companies.length}`);
-  console.log(`Mode: latest + post-sort by engagement, limitPerCompany=${limitPerCompany}, ${describePopularity(minLikes, maxLikes, minRetweets)}`);
+  console.log(`Mode: latest + post-sort by engagement, limitPerCompany=${limitPerCompany}, companyConcurrency=${companyConcurrency}, repliesPerTweet=${repliesPerTweet}, ${describePopularity(minLikes, maxLikes, minRetweets)}`);
   for (const company of companies) {
-    console.log(`Query: "${company.name}" ${company.code} -filter:retweets`);
+    console.log(`Query: "${company.name}" ${company.code} -filter:nativeretweets`);
   }
   if (dryRun) return;
 
@@ -475,89 +1028,88 @@ async function runCompany(options: Options, focusComments: boolean): Promise<voi
   await mkdir(path.join(outDir, "reports"), { recursive: true });
 
   const stamp = today();
-  const prefix = focusComments ? "company-comments" : "company-latest";
+  const prefix = "company-latest";
   const jsonPath = path.join(outDir, "raw", `${prefix}-${stamp}.json`);
   const csvPath = path.join(outDir, "raw", `${prefix}-${stamp}.csv`);
-  const mdPath = path.join(outDir, "reports", `${prefix}-${stamp}.md`);
+  const commentsJsonPath = path.join(outDir, "raw", `${prefix}-${stamp}-comments.json`);
+  const commentsCsvPath = path.join(outDir, "raw", `${prefix}-${stamp}-comments.csv`);
+  const summaryCsvPath = path.join(outDir, "raw", `${prefix}-${stamp}-summary.csv`);
+  const indexPath = path.join(outDir, "reports", `${prefix}-${stamp}-index.md`);
   const tracePath = path.join(outDir, "raw", `${prefix}-${stamp}.trace.jsonl`);
-  const reportParts: string[] = [`# 企業X検索まとめ ${stamp}`];
-  const csvRows: Array<Record<string, unknown>> = [];
-  const allTweets: Tweet[] = [];
 
-  logRunEvent(events, {
+  await writeFile(tracePath, "", "utf-8");
+  const log = createRunLogger(events, tracePath);
+
+  await log({
     level: "info",
     message: "run started",
-    details: { companies: companies.length, limitPerCompany, repliesPerTweet, focusComments, outDir },
+    details: { companies: companies.length, limitPerCompany, repliesPerTweet, companyConcurrency, sentimentEnabled, sentimentUrl, outDir },
   });
 
-  for (const [index, company] of companies.entries()) {
-    const companyStartedAt = Date.now();
-    const query = `"${company.name}" ${company.code} -filter:retweets`;
-    logRunEvent(events, {
-      level: "info",
-      message: "company started",
+  const results = await mapWithConcurrency(companies, companyConcurrency, (company, index) =>
+    processCompany({
       company,
-      details: { index: index + 1, total: companies.length, query },
-    });
-    await writeRunEvents(tracePath, events);
+      index,
+      total: companies.length,
+      prefix,
+      stamp,
+      reportsDir: path.join(outDir, "reports"),
+      limitPerCompany,
+      minLikes,
+      maxLikes,
+      minRetweets,
+      repliesPerTweet,
+      sentimentEnabled,
+      sentimentUrl,
+      log,
+    }),
+  );
 
-    try {
-      logRunEvent(events, { level: "info", message: "search started", company, details: { max: Math.max(limitPerCompany * 3, limitPerCompany) } });
-      await writeRunEvents(tracePath, events);
-      const searched = await searchTwitter(query, Math.max(limitPerCompany * 3, limitPerCompany), "latest");
-      logRunEvent(events, { level: "info", message: "search finished", company, details: { count: searched.length } });
-
-      const filtered = searched
-        .filter((tweet) => matchesPopularity(tweet, minLikes, maxLikes, minRetweets))
-        .sort((a, b) => engagement(b) - engagement(a) || String(b.createdAtISO ?? "").localeCompare(String(a.createdAtISO ?? "")))
-        .slice(0, limitPerCompany);
-      if (filtered.length === 0) {
-        logRunEvent(events, { level: "warn", message: "popularity filters matched 0 tweets", company });
-      }
-
-      logRunEvent(events, { level: "info", message: "replies fetch started", company, details: { tweets: filtered.length, repliesPerTweet } });
-      await writeRunEvents(tracePath, events);
-      const tweets = (await withReplies(filtered, repliesPerTweet)).map((tweet) => ({ ...tweet, companyName: company.name, companyCode: company.code, searchQuery: query }));
-      logRunEvent(events, { level: "info", message: "replies fetched", company, details: { tweets: tweets.length, repliesPerTweet } });
-
-      allTweets.push(...tweets);
-      csvRows.push(...tweets.map((tweet) => ({ companyName: company.name, companyCode: company.code, ...compactTweet(tweet) })));
-      reportParts.push(`\n## ${company.name} (${company.code})\n`);
-      logRunEvent(events, { level: "info", message: "summary started", company, details: { tweets: tweets.length } });
-      await writeRunEvents(tracePath, events);
-      reportParts.push(await summarizeCompany(company, tweets, focusComments));
-      logRunEvent(events, { level: "info", message: "summary finished", company, details: { duration: formatDuration(companyStartedAt) } });
-    } catch (error) {
-      const message = errorMessage(error);
-      logRunEvent(events, { level: "error", message: "company failed; continuing with remaining companies", company, details: { error: message } });
-      reportParts.push(`\n## ${company.name} (${company.code})\n`);
-      reportParts.push(["この企業の処理は失敗しました。", "", `- エラー: ${message}`, `- クエリ: ${query}`, "- 詳細: trace JSONL を確認してください。"].join("\n"));
-    }
-
-    await writeRunEvents(tracePath, events);
-    await writeFile(jsonPath, JSON.stringify(allTweets, null, 2), "utf-8");
-    await writeFile(csvPath, toCsv(csvRows) + "\n", "utf-8");
-    await writeFile(mdPath, reportParts.join("\n\n"), "utf-8");
-  }
-
-  logRunEvent(events, { level: "info", message: "run finished", details: { tweets: allTweets.length, companies: companies.length } });
+  const allTweets = results.flatMap((result) => result.tweets);
+  const allComments = results.flatMap((result) => result.comments);
+  const csvRows = results.flatMap((result) => result.csvRows);
+  const commentRows = results.flatMap((result) => result.commentRows);
+  const summaryRows = results.map((result) => result.summaryRow);
+  const indexBody = [
+    `# 企業X検索まとめ ${stamp}`,
+    "",
+    `- 企業数: ${companies.length}`,
+    `- 並列数: ${companyConcurrency}`,
+    `- ツイート数: ${allTweets.length}`,
+    `- 取得コメント数: ${allComments.length}`,
+    `- コメントraw: ${path.relative(path.join(outDir, "reports"), commentsJsonPath)}`,
+    `- 感情分析: ${sentimentEnabled ? `実行（${sentimentUrl}）` : "未実行"}`,
+    `- 失敗企業数: ${results.filter((result) => result.error).length}`,
+    "",
+    "## 会社別レポート",
+    "",
+    ...results.map((result) => `- ${result.company.name} (${result.company.code}): ${path.relative(path.join(outDir, "reports"), result.reportPath)}${result.error ? "（失敗）" : ""}`),
+  ].join("\n");
 
   await writeFile(jsonPath, JSON.stringify(allTweets, null, 2), "utf-8");
   await writeFile(csvPath, toCsv(csvRows) + "\n", "utf-8");
-  await writeFile(mdPath, reportParts.join("\n\n"), "utf-8");
+  await writeFile(commentsJsonPath, JSON.stringify(allComments, null, 2), "utf-8");
+  await writeFile(commentsCsvPath, toCsv(commentRows) + "\n", "utf-8");
+  await writeFile(summaryCsvPath, toCsv(summaryRows) + "\n", "utf-8");
+  await writeFile(indexPath, indexBody + "\n", "utf-8");
+
+  await log({ level: "info", message: "run finished", details: { tweets: allTweets.length, comments: allComments.length, companies: companies.length, failedCompanies: results.filter((result) => result.error).length } });
   await writeRunEvents(tracePath, events);
 
   console.log(`Saved raw: ${jsonPath}`);
   console.log(`Saved csv: ${csvPath}`);
-  console.log(`Saved summary: ${mdPath}`);
+  console.log(`Saved comments raw: ${commentsJsonPath}`);
+  console.log(`Saved comments csv: ${commentsCsvPath}`);
+  console.log(`Saved summary csv: ${summaryCsvPath}`);
+  console.log(`Saved report index: ${indexPath}`);
+  console.log(`Saved company reports: ${path.join(outDir, "reports", `${prefix}-${stamp}-<code>-<name>.md`)}`);
   console.log(`Saved trace: ${tracePath}`);
 }
 
 async function main(): Promise<void> {
   const { command, options } = parseArgs(process.argv.slice(2));
   if (command === "ai-trend") await runAiTrend(options);
-  if (command === "company-latest") await runCompany(options, false);
-  if (command === "company-comments") await runCompany(options, true);
+  if (command === "company-latest") await runCompany(options);
 }
 
 main().catch((error: unknown) => {
