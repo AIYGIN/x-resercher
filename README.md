@@ -900,7 +900,7 @@ data/reports/company-latest-YYYY-MM-DD-<code>-<name>.md
 ## よく使うコマンド
 
 ```bash
-pnpm company-summary-csv \
+pnpm company-latest \
   --companies data/companies.csv \
   --limit-per-company 10 \
   --company-concurrency 3 \
