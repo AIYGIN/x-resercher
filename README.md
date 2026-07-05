@@ -896,3 +896,17 @@ data/raw/company-latest-YYYY-MM-DD.trace.jsonl
 data/reports/company-latest-YYYY-MM-DD-index.md
 data/reports/company-latest-YYYY-MM-DD-<code>-<name>.md
 ```
+
+## よく使うコマンド
+
+```bash
+pnpm company-summary-csv \
+  --companies data/companies.csv \
+  --limit-per-company 10 \
+  --company-concurrency 3 \
+  --with-replies \
+  --replies-per-tweet 10 \
+  --min-likes 10 \
+  --sentiment \
+  --sentiment-url http://127.0.0.1:8000/analyze
+```

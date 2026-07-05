@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -13,7 +13,7 @@ const OLLAMA_TIMEOUT_MS = 300_000;
 const DEFAULT_SENTIMENT_URL = "http://127.0.0.1:8000/analyze";
 const SENTIMENT_TIMEOUT_MS = 30_000;
 
-type Command = "ai-trend" | "company-latest";
+type Command = "ai-trend" | "company-latest" | "company-summary-csv";
 
 type Tweet = {
   id: string;
@@ -125,6 +125,7 @@ function usage(exitCode = 0): never {
 Usage:
   pnpm start -- ai-trend [--limit 30] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--replies-per-tweet 5] [--dry-run]
   pnpm start -- company-latest --companies data/companies.csv [--limit-per-company 10] [--company-concurrency 3] [--with-replies] [--replies-per-tweet 10] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--sentiment] [--sentiment-url http://127.0.0.1:8000/analyze] [--dry-run]
+  pnpm start -- company-summary-csv --companies data/companies.csv [--limit-per-company 10] [--company-concurrency 3] [--with-replies] [--replies-per-tweet 10] [--min-likes 0] [--max-likes N] [--min-retweets 0] [--sentiment] [--sentiment-url http://127.0.0.1:8000/analyze] [--dry-run]
 
 Patterns:
   ai-trend         codex OR "AI Agent" を人気寄り・latest で30件取得し、qwen3:8bで要約してCSV化します。
@@ -139,21 +140,22 @@ Company file format:
 }
 
 function parseArgs(argv: string[]): { command: Command; options: Options } {
-  const commandRaw = argv[0];
+  const normalizedArgs = argv[0] === "--" ? argv.slice(1) : argv;
+  const commandRaw = normalizedArgs[0];
 
   if (!commandRaw || commandRaw === "help" || commandRaw === "--help" || commandRaw === "-h") {
     usage(0);
   }
 
-  if (!["ai-trend", "company-latest"].includes(commandRaw)) {
+  if (!["ai-trend", "company-latest", "company-summary-csv"].includes(commandRaw)) {
     console.error(`Unknown command: ${commandRaw}`);
     usage(1);
   }
 
   const command = commandRaw as Command;
   const options: Options = {};
-  for (let i = 1; i < argv.length; i += 1) {
-    const arg = argv[i];
+  for (let i = 1; i < normalizedArgs.length; i += 1) {
+    const arg = normalizedArgs[i];
     if (!arg.startsWith("--")) {
       console.error(`Unexpected positional argument: ${arg}`);
       usage(1);
@@ -344,9 +346,14 @@ function tweetUrl(tweet: Tweet): string {
   return `https://x.com/${screenName}/status/${tweet.id}`;
 }
 
+function normalizeCsvText(value: string): string {
+  return value.replace(/\r\n?/g, "\n").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+}
+
 function csvEscape(value: unknown): string {
   const text = value === undefined || value === null ? "" : String(value);
-  return `"${text.replaceAll('"', '""')}"`;
+  const normalized = normalizeCsvText(text);
+  return `"${normalized.replaceAll('"', '""')}"`;
 }
 
 function toCsv(rows: Array<Record<string, unknown>>): string {
@@ -356,6 +363,93 @@ function toCsv(rows: Array<Record<string, unknown>>): string {
     headers.join(","),
     ...rows.map((row) => headers.map((header) => csvEscape(row[header])).join(",")),
   ].join("\n");
+}
+
+function compactSummaryRowForCsv(summaryRow: Record<string, unknown>): Record<string, unknown> {
+  const parseScore = (value: unknown): number | "" => {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string") {
+      const trimmed = value.trim();
+      if (!trimmed) return "";
+      const parsed = Number(trimmed);
+      return Number.isFinite(parsed) ? parsed : "";
+    }
+    return "";
+  };
+
+  return {
+    companyName: summaryRow.companyName ?? "",
+    companyCode: summaryRow.companyCode ?? "",
+    tweetSummary: summaryRow.tweetSummary ?? "",
+    commentSummary: summaryRow.commentSummary ?? "",
+    investmentIssues: summaryRow.investmentIssues ?? "",
+    investmentHints: summaryRow.investmentHints ?? "",
+    tweetSentimentScore: parseScore(summaryRow.tweetSentimentScore0To100 ?? summaryRow.tweetSentimentScore),
+    commentSentimentScore: parseScore(summaryRow.commentSentimentScore0To100 ?? summaryRow.commentSentimentScore),
+  };
+}
+
+function parseMarkdownTableRow(line: string): string[] {
+  return line
+    .trim()
+    .split("|")
+    .slice(1, -1)
+    .map((cell) => cell.trim());
+}
+
+function parseSentimentScoreFromText(text: string): number | "" {
+  const trimmed = text.trim();
+  if (!trimmed) return "";
+  const match = trimmed.match(/(\d+)(?:\/100)?/);
+  return match ? Number(match[1]) : "";
+}
+
+function parseReportMarkdownToSummaryRow(markdown: string): Record<string, unknown> | null {
+  const lines = markdown.split(/\r?\n/);
+  const tableLines = lines.filter((line) => line.trim().startsWith("|"));
+  if (tableLines.length < 3) return null;
+
+  const headerCells = parseMarkdownTableRow(tableLines[0]);
+  const dataCells = parseMarkdownTableRow(tableLines[2]);
+  if (headerCells.length === 0 || dataCells.length === 0 || headerCells.length !== dataCells.length) return null;
+
+  const row = Object.fromEntries(headerCells.map((header, index) => [header, dataCells[index] ?? ""]));
+  return {
+    companyName: row["会社名"] ?? "",
+    companyCode: row["会社コード"] ?? "",
+    tweetSummary: row["ツイート要約"] ?? "",
+    commentSummary: row["コメント要約"] ?? "",
+    investmentIssues: row["投資判断の課題"] ?? "",
+    investmentHints: row["投資判断のヒント"] ?? "",
+    tweetSentimentScore0To100: parseSentimentScoreFromText(String(row["ツイート感情スコア"] ?? "")),
+    commentSentimentScore0To100: parseSentimentScoreFromText(String(row["コメント感情スコア"] ?? "")),
+  };
+}
+
+async function writeSummaryCsvsFromReports(reportsDir: string, outDir: string): Promise<void> {
+  const csvDir = path.join(outDir, "reports", "csv");
+  await mkdir(csvDir, { recursive: true });
+
+  const reportEntries = (await readdir(reportsDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.startsWith("company-latest-") && !entry.name.endsWith("-index.md"))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
+  if (reportEntries.length === 0) {
+    throw new Error(`No company report markdown files found in ${reportsDir}`);
+  }
+
+  await Promise.all(
+    reportEntries.map(async (entry) => {
+      const reportPath = path.join(reportsDir, entry.name);
+      const markdown = await readFile(reportPath, "utf-8");
+      const summaryRow = parseReportMarkdownToSummaryRow(markdown);
+      if (!summaryRow || !summaryRow.companyCode) return;
+
+      const companyCode = String(summaryRow.companyCode).trim();
+      const outputPath = path.join(csvDir, `${safePathSegment(companyCode)}-aisummary.csv`);
+      await writeFile(outputPath, toCsv([compactSummaryRowForCsv(summaryRow as Record<string, unknown>)]) + "\n", "utf-8");
+    }),
+  );
 }
 
 function compactTweet(tweet: Tweet): Record<string, unknown> {
@@ -997,7 +1091,7 @@ async function processCompany(params: {
   }
 }
 
-async function runCompany(options: Options): Promise<void> {
+async function runCompanyWithOutputs(options: Options, outputMode: "company-latest" | "company-summary-csv"): Promise<void> {
   const companiesPath = optionString(options, "companies");
   if (!companiesPath) throw new Error("--companies is required");
 
@@ -1026,6 +1120,7 @@ async function runCompany(options: Options): Promise<void> {
 
   await mkdir(path.join(outDir, "raw"), { recursive: true });
   await mkdir(path.join(outDir, "reports"), { recursive: true });
+  await mkdir(path.join(outDir, "reports", "csv"), { recursive: true });
 
   const stamp = today();
   const prefix = "company-latest";
@@ -1043,7 +1138,7 @@ async function runCompany(options: Options): Promise<void> {
   await log({
     level: "info",
     message: "run started",
-    details: { companies: companies.length, limitPerCompany, repliesPerTweet, companyConcurrency, sentimentEnabled, sentimentUrl, outDir },
+    details: { companies: companies.length, limitPerCompany, repliesPerTweet, companyConcurrency, sentimentEnabled, sentimentUrl, outDir, outputMode },
   });
 
   const results = await mapWithConcurrency(companies, companyConcurrency, (company, index) =>
@@ -1090,8 +1185,18 @@ async function runCompany(options: Options): Promise<void> {
   await writeFile(csvPath, toCsv(csvRows) + "\n", "utf-8");
   await writeFile(commentsJsonPath, JSON.stringify(allComments, null, 2), "utf-8");
   await writeFile(commentsCsvPath, toCsv(commentRows) + "\n", "utf-8");
-  await writeFile(summaryCsvPath, toCsv(summaryRows) + "\n", "utf-8");
   await writeFile(indexPath, indexBody + "\n", "utf-8");
+
+  if (outputMode === "company-latest") {
+    await writeFile(summaryCsvPath, toCsv(summaryRows) + "\n", "utf-8");
+  } else {
+    await Promise.all(
+      results.map(async (result) => {
+        const summaryCsvPathForCompany = path.join(outDir, "reports", "public", `${safePathSegment(result.company.code)}-aisummary.csv`);
+        await writeFile(summaryCsvPathForCompany, toCsv([compactSummaryRowForCsv(result.summaryRow)]) + "\n", "utf-8");
+      }),
+    );
+  }
 
   await log({ level: "info", message: "run finished", details: { tweets: allTweets.length, comments: allComments.length, companies: companies.length, failedCompanies: results.filter((result) => result.error).length } });
   await writeRunEvents(tracePath, events);
@@ -1100,16 +1205,34 @@ async function runCompany(options: Options): Promise<void> {
   console.log(`Saved csv: ${csvPath}`);
   console.log(`Saved comments raw: ${commentsJsonPath}`);
   console.log(`Saved comments csv: ${commentsCsvPath}`);
-  console.log(`Saved summary csv: ${summaryCsvPath}`);
+  if (outputMode === "company-latest") {
+    console.log(`Saved summary csv: ${summaryCsvPath}`);
+  } else {
+    console.log(`Saved ai summary csvs: ${path.join(outDir, "reports", "csv", "<code>-aisummary.csv")}`);
+  }
   console.log(`Saved report index: ${indexPath}`);
   console.log(`Saved company reports: ${path.join(outDir, "reports", `${prefix}-${stamp}-<code>-<name>.md`)}`);
   console.log(`Saved trace: ${tracePath}`);
 }
 
+async function runCompany(options: Options): Promise<void> {
+  await runCompanyWithOutputs(options, "company-latest");
+}
+
+async function runCompanySummaryCsv(options: Options): Promise<void> {
+  const outDir = optionString(options, "out-dir", "data") ?? "data";
+  const reportsDir = path.join(outDir, "reports");
+  await writeSummaryCsvsFromReports(reportsDir, outDir);
+  console.log(`Generated per-company summary CSVs from reports in ${reportsDir}`);
+}
+
+export { writeSummaryCsvsFromReports };
+
 async function main(): Promise<void> {
   const { command, options } = parseArgs(process.argv.slice(2));
   if (command === "ai-trend") await runAiTrend(options);
   if (command === "company-latest") await runCompany(options);
+  if (command === "company-summary-csv") await runCompanySummaryCsv(options);
 }
 
 main().catch((error: unknown) => {

@@ -7,6 +7,7 @@
     "start": "tsx src/index.ts",
     "ai-trend": "tsx src/index.ts ai-trend --limit 30",
     "company-latest": "tsx src/index.ts company-latest",
+    "company-summary-csv": "tsx src/index.ts company-summary-csv",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [],
