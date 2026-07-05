@@ -8,5 +8,5 @@
     "types": ["node"],
     "outDir": "dist"
   },
-  "include": ["src/index.ts"]
+  "include": ["src/**/*.ts", "scripts/**/*.ts"]
 }

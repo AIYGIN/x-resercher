@@ -2,6 +2,21 @@
 
 X/Twitter の公開検索結果を `twitter` コマンドで取得し、ローカルLLM（Ollama + qwen3:8b）で要約・CSV化するための小さな実験プロジェクトです。
 
+## 初回セットアップ
+
+```bash
+docker compose up -d
+pnpm run publish
+```
+
+> `pnpm publish` は pnpm のパッケージ公開コマンドなので、MinIO へのアップロードは `pnpm run publish` を使います。
+
+## MinIO Console
+
+```text
+http://localhost:9001
+```
+
 ## 現在のコマンド
 
 既存の汎用的な `x search` ではなく、以下の2パターンだけを扱います。
