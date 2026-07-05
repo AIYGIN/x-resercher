@@ -427,7 +427,7 @@ function parseReportMarkdownToSummaryRow(markdown: string): Record<string, unkno
 }
 
 async function writeSummaryCsvsFromReports(reportsDir: string, outDir: string): Promise<void> {
-  const csvDir = path.join(outDir, "reports", "csv");
+  const csvDir = path.join(outDir, "public");
   await mkdir(csvDir, { recursive: true });
 
   const reportEntries = (await readdir(reportsDir, { withFileTypes: true }))
@@ -1192,7 +1192,7 @@ async function runCompanyWithOutputs(options: Options, outputMode: "company-late
   } else {
     await Promise.all(
       results.map(async (result) => {
-        const summaryCsvPathForCompany = path.join(outDir, "reports", "public", `${safePathSegment(result.company.code)}-aisummary.csv`);
+        const summaryCsvPathForCompany = path.join(outDir, "public", `${safePathSegment(result.company.code)}-aisummary.csv`);
         await writeFile(summaryCsvPathForCompany, toCsv([compactSummaryRowForCsv(result.summaryRow)]) + "\n", "utf-8");
       }),
     );
@@ -1208,7 +1208,7 @@ async function runCompanyWithOutputs(options: Options, outputMode: "company-late
   if (outputMode === "company-latest") {
     console.log(`Saved summary csv: ${summaryCsvPath}`);
   } else {
-    console.log(`Saved ai summary csvs: ${path.join(outDir, "reports", "csv", "<code>-aisummary.csv")}`);
+    console.log(`Saved ai summary csvs: ${path.join(outDir, "public", "<code>-aisummary.csv")}`);
   }
   console.log(`Saved report index: ${indexPath}`);
   console.log(`Saved company reports: ${path.join(outDir, "reports", `${prefix}-${stamp}-<code>-<name>.md`)}`);
@@ -1223,7 +1223,7 @@ async function runCompanySummaryCsv(options: Options): Promise<void> {
   const outDir = optionString(options, "out-dir", "data") ?? "data";
   const reportsDir = path.join(outDir, "reports");
   await writeSummaryCsvsFromReports(reportsDir, outDir);
-  console.log(`Generated per-company summary CSVs from reports in ${reportsDir}`);
+  console.log(`Generated per-company summary CSVs in ${path.join(outDir, "public")}`);
 }
 
 export { writeSummaryCsvsFromReports };
